@@ -8,3 +8,5 @@ Browser based on chromium
 
 This is everything for now new update soon
 Next update expected : 2.0.0
+
+warning i do not recommend using the browser as your main browser because it is in beta
