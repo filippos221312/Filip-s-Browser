@@ -1,6 +1,7 @@
 import base64
 import csv
 import glob
+import io
 import json
 import os
 import re
@@ -12,12 +13,18 @@ import time
 from datetime import datetime
 from html import escape
 from html.parser import HTMLParser
+import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
+import zipfile
 from urllib.parse import quote, quote_plus, urlsplit
 
 from PySide6.QtCore import (
+    QAbstractAnimation,
+    QEasingCurve,
+    QEvent,
     QObject,
+    QPropertyAnimation,
     QRectF,
     QSettings,
     QSize,
@@ -26,8 +33,10 @@ from PySide6.QtCore import (
     QTimer,
     QUrl,
     QUrlQuery,
+    QVariantAnimation,
     Qt,
     Signal,
+    qVersion,
 )
 from PySide6.QtGui import (
     QAction,
@@ -77,6 +86,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QSystemTrayIcon,
+    QTabBar,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -175,6 +185,7 @@ DEFAULT_TRACKERS = {
 #   change in incognito windows
 #   (a link to href="browser://assistant" opens the AI chat)
 #   {{FONT_FACE}} = CSS that loads the Oswald font from the fonts folder (if present)
+#   {{WIDGET_LAYER}} = the movable widgets and the "Widgets" button
 DEFAULT_HOME_HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -238,9 +249,26 @@ DEFAULT_HOME_HTML = """<!DOCTYPE html>
   }
   .tile:hover .x { opacity: 1; }
   .x:hover { background: #c0392b; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+  @keyframes popIn { from { opacity: 0; transform: scale(0.85); } to { opacity: 1; transform: none; } }
+  @keyframes floaty { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+  .logo { animation: fadeUp 0.7s ease-out backwards; }
+  .mark { animation: floaty 4s ease-in-out 1s infinite; }
+  .note { animation: fadeUp 0.7s 0.1s ease-out backwards; }
+  form { animation: fadeUp 0.7s 0.15s ease-out backwards; }
+  .ai { animation: fadeUp 0.7s 0.25s ease-out backwards; transition: transform 0.2s, filter 0.2s; }
+  .ai:hover { transform: translateY(-2px) scale(1.04); }
+  .tile, .add { animation: popIn 0.5s calc(0.35s + var(--i, 0) * 0.06s) ease-out backwards; }
+  .tile a.site, .add { transition: background 0.2s, color 0.2s, transform 0.2s; }
+  .tile a.site:hover, .add:hover { transform: translateY(-3px); }
+  input { transition: border-color 0.2s, background 0.2s, box-shadow 0.2s; }
+  input:focus { box-shadow: 0 0 0 4px rgba(110, 168, 255, 0.2); }
+  .x { transition: opacity 0.2s, background 0.2s; }
+  .noanim, .noanim * { animation: none !important; transition: none !important; }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 </style>
 </head>
-<body>
+<body class="{{BODY_CLASS}}">
   <div class="logo"><div class="mark">F</div><div class="word">{{APP_NAME}}</div></div>
   <div class="note">{{NOTE}}</div>
   <form action="{{ACTION}}" method="get">
@@ -250,6 +278,7 @@ DEFAULT_HOME_HTML = """<!DOCTYPE html>
   <div class="links">
     {{SHORTCUTS}}
   </div>
+{{WIDGET_LAYER}}
 </body>
 </html>
 """
@@ -324,6 +353,23 @@ SERVICES = [
     service_entry("pinterest", "Pinterest", "https://www.pinterest.com", "#E60023", "P"),
     service_entry("bluesky", "Bluesky", "https://bsky.app", "#1185FE", "B"),
 ]
+# Bigger, easier-to-press controls
+TOOLBAR_STYLE = """
+QToolButton { padding: 5px 10px; font-size: 15px; border-radius: 7px; }
+QToolButton:hover { background: rgba(128, 128, 128, 0.22); }
+"""
+CLOSE_BUTTON_STYLE = """
+QToolButton { border: none; border-radius: 13px; font-size: 13px; }
+QToolButton:hover { background: rgba(230, 60, 60, 0.9); color: white; }
+"""
+NEW_TAB_BUTTON_STYLE = """
+QToolButton { border: none; border-radius: 9px; font-size: 22px; }
+QToolButton:hover { background: rgba(128, 128, 128, 0.25); }
+"""
+LOAD_BAR_STYLE = """
+QProgressBar { border: none; background: transparent; }
+QProgressBar::chunk { background: #6ea8ff; }
+"""
 DEFAULT_SIDEBAR = ["whatsapp", "instagram", "tiktok", "x", "youtube", "discord", "twitch"]
 
 SIDEBAR_STYLE = """
@@ -358,6 +404,9 @@ PERMISSION_NAMES = {
 
 # Shows web notifications as Windows pop-ups. Created in main().
 NOTIFICATIONS = None
+
+# Whether animations are switched on (see Appearance).
+ANIMATIONS_ENABLED = True
 
 
 def make_icon(service):
@@ -1140,6 +1189,1177 @@ def save_background_image(source, destination, max_bytes=900_000):
     return os.path.getsize(destination) <= max_bytes
 
 
+def set_animations(enabled):
+    global ANIMATIONS_ENABLED
+    ANIMATIONS_ENABLED = bool(enabled)
+
+
+class FadeInFilter(QObject):
+    """Makes dialogs and pop-up windows fade in instead of appearing instantly."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Show and ANIMATIONS_ENABLED and isinstance(obj, QWidget):
+            if (
+                obj.isWindow()
+                and not isinstance(obj, QMainWindow)
+                and obj.windowType() in (Qt.WindowType.Window, Qt.WindowType.Dialog)
+                and obj.findChild(QWebEngineView) is None
+            ):
+                obj.setWindowOpacity(0.0)
+                animation = QPropertyAnimation(obj, b"windowOpacity", obj)
+                animation.setDuration(170)
+                animation.setStartValue(0.0)
+                animation.setEndValue(1.0)
+                animation.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+        return False
+
+
+class AnimatedToolButton(QToolButton):
+    """A button whose icon grows a little while the mouse is over it."""
+
+    def __init__(self, base=30, grown=35):
+        super().__init__()
+        self.base = base
+        self.grown = grown
+        self.setIconSize(QSize(base, base))
+        self.grow_animation = QVariantAnimation(self)
+        self.grow_animation.setDuration(120)
+        self.grow_animation.valueChanged.connect(
+            lambda value: self.setIconSize(QSize(int(value), int(value)))
+        )
+
+    def resize_icon(self, target):
+        self.grow_animation.stop()
+        if not ANIMATIONS_ENABLED:
+            self.setIconSize(QSize(target, target))
+            return
+        self.grow_animation.setStartValue(self.iconSize().width())
+        self.grow_animation.setEndValue(target)
+        self.grow_animation.start()
+
+    def enterEvent(self, event):
+        self.resize_icon(self.grown)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.resize_icon(self.base)
+        super().leaveEvent(event)
+
+
+class BigTabBar(QTabBar):
+    """A tab bar with larger tabs that are easier to hit."""
+
+    def __init__(self):
+        super().__init__()
+        self.setElideMode(Qt.TextElideMode.ElideRight)
+        self.setExpanding(False)
+        self.setMovable(True)  # drag a tab to reorder it
+        self.setUsesScrollButtons(True)
+
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        return QSize(max(170, min(size.width() + 28, 260)), max(size.height(), 42))
+
+    def minimumTabSizeHint(self, index):
+        return QSize(110, 42)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:  # middle-click closes a tab
+            index = self.tabAt(event.position().toPoint())
+            if index >= 0:
+                self.tabCloseRequested.emit(index)
+                return
+        super().mouseReleaseEvent(event)
+
+
+class BrowserTabs(QTabWidget):
+    def __init__(self):
+        super().__init__()
+        self.setTabBar(BigTabBar())
+
+
+# ---------- Chrome Web Store extensions ----------
+# The store's own "Add to Chrome" button only works inside Chrome, so we download the
+# extension file (.crx) from the store ourselves, unpack it, and install it from a folder.
+
+STORE_HOSTS = ("chromewebstore.google.com", "chrome.google.com")
+
+
+def extension_id_from_text(text):
+    """A Chrome Web Store link or a bare 32-letter extension id -> the id ('' if none)."""
+    text = text.strip()
+    if re.fullmatch(r"[a-p]{32}", text):
+        return text
+    match = re.search(r"/([a-p]{32})(?:[/?#]|$)", text)
+    return match.group(1) if match else ""
+
+
+def store_extension_id(url):
+    """The extension id if url is a Chrome Web Store page, otherwise ''."""
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+    return extension_id_from_text(url) if host in STORE_HOSTS else ""
+
+
+def crx_to_zip_bytes(data):
+    """A .crx file is a zip file with a small header in front. Return just the zip part."""
+    if data[:4] != b"Cr24":
+        raise ValueError("This isn't a Chrome extension file.")
+    version = int.from_bytes(data[4:8], "little")
+    if version == 3:
+        start = 12 + int.from_bytes(data[8:12], "little")
+    elif version == 2:
+        start = 16 + int.from_bytes(data[8:12], "little") + int.from_bytes(data[12:16], "little")
+    else:
+        raise ValueError(f"Unsupported extension file version ({version}).")
+    return data[start:]
+
+
+def unpack_extension(data, folder):
+    """Unpack a .crx or .zip into folder (replacing what was there). Returns the manifest."""
+    if data[:4] == b"Cr24":
+        data = crx_to_zip_bytes(data)
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("The extension file is damaged or isn't a real extension.")
+    if os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+    os.makedirs(folder, exist_ok=True)
+    base = os.path.realpath(folder)
+    with archive:
+        for member in archive.infolist():
+            name = member.filename
+            if not name or name.endswith("/") or name.startswith("_metadata/"):
+                continue
+            target = os.path.realpath(os.path.join(folder, name))
+            if not target.startswith(base + os.sep):
+                continue  # ignore any file that tries to escape the folder
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with archive.open(member) as source, open(target, "wb") as destination:
+                shutil.copyfileobj(source, destination)
+    manifest_path = os.path.join(folder, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise ValueError("The extension has no manifest.json, so it can't be installed.")
+    with open(manifest_path, encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+class ExtensionDownloader(QThread):
+    """Downloads an extension file from the Chrome Web Store without freezing the browser."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, extension_id, chrome_version):
+        super().__init__()
+        self.extension_id = extension_id
+        self.chrome_version = chrome_version
+
+    def run(self):
+        url = (
+            "https://clients2.google.com/service/update2/crx?response=redirect"
+            f"&prodversion={self.chrome_version}&acceptformat=crx2,crx3"
+            f"&x=id%3D{self.extension_id}%26uc"
+        )
+        agent = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{self.chrome_version} Safari/537.36"
+        )
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": agent})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = response.read()
+            if data[:4] != b"Cr24":
+                raise ValueError("no extension file")
+            self.succeeded.emit(data)
+        except urllib.error.HTTPError as error:
+            self.failed.emit(f"The Chrome Web Store refused the download (error {error.code}).")
+        except ValueError:
+            self.failed.emit(
+                "The Chrome Web Store didn't send an extension file for this ID. "
+                "It may not exist, may be unavailable, or may be restricted."
+            )
+        except Exception as error:
+            self.failed.emit(f"Could not download the extension: {error}")
+
+
+# ---------- Home screen widgets ----------
+# The widgets live in the home page itself (see WIDGET_JS). The page talks to the browser
+# through console messages that carry a secret token created fresh at every start, and the
+# browser fetches weather and news for it (web pages can't read most news feeds directly).
+
+HOME_PREFIX = "__filips_home__:"
+HOME_TOKEN = secrets.token_hex(16)
+WIDGET_IDS = (
+    "clock", "weather", "news", "profiles", "notes", "todo",
+    "bookmarks", "history", "calculator", "timer", "quote",
+)
+NEWS_SOURCES = {
+    "bbc": ("BBC News - top stories", "https://feeds.bbci.co.uk/news/rss.xml"),
+    "bbc-world": ("BBC News - world", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+    "bbc-tech": ("BBC News - technology", "https://feeds.bbci.co.uk/news/technology/rss.xml"),
+    "bbc-sport": ("BBC Sport", "https://feeds.bbci.co.uk/sport/rss.xml"),
+    "npr": ("NPR", "https://feeds.npr.org/1001/rss.xml"),
+    "guardian": ("The Guardian - world", "https://www.theguardian.com/world/rss"),
+    "aljazeera": ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    "ars": ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    "verge": ("The Verge", "https://www.theverge.com/rss/index.xml"),
+    "hn": ("Hacker News", "https://hnrss.org/frontpage"),
+}
+
+
+def sanitize_widget_state(data):
+    """Keep only what a widget layout is allowed to contain (the page is trusted, but be careful)."""
+    result = {"enabled": [], "pos": {}, "config": {}}
+    if not isinstance(data, dict):
+        return result
+    enabled = data.get("enabled")
+    if isinstance(enabled, list):
+        for widget_id in enabled:
+            if widget_id in WIDGET_IDS and widget_id not in result["enabled"]:
+                result["enabled"].append(widget_id)
+    positions = data.get("pos")
+    if isinstance(positions, dict):
+        for widget_id, spot in positions.items():
+            if widget_id in WIDGET_IDS and isinstance(spot, dict):
+                try:
+                    x, y = float(spot.get("x")), float(spot.get("y"))
+                except (TypeError, ValueError):
+                    continue
+                if x == x and y == y:  # skips NaN
+                    result["pos"][widget_id] = {"x": min(1.0, max(0.0, x)), "y": min(1.0, max(0.0, y))}
+    config = data.get("config")
+    if isinstance(config, dict):
+        out = result["config"]
+        weather = config.get("weather")
+        if isinstance(weather, dict):
+            out["weather"] = {
+                "city": str(weather.get("city", ""))[:80],
+                "unit": "f" if weather.get("unit") == "f" else "c",
+            }
+        news = config.get("news")
+        if isinstance(news, dict):
+            source = str(news.get("source", "bbc"))
+            out["news"] = {
+                "source": source if source in NEWS_SOURCES or source == "custom" else "bbc",
+                "custom": str(news.get("custom", ""))[:300],
+            }
+        notes = config.get("notes")
+        if isinstance(notes, dict):
+            out["notes"] = {"text": str(notes.get("text", ""))[:5000]}
+        todo = config.get("todo")
+        if isinstance(todo, dict) and isinstance(todo.get("items"), list):
+            items = []
+            for item in todo["items"]:
+                if isinstance(item, dict) and str(item.get("t", "")).strip():
+                    items.append({"t": str(item["t"])[:200], "d": bool(item.get("d"))})
+                if len(items) >= 50:
+                    break
+            out["todo"] = {"items": items}
+        timer = config.get("timer")
+        if isinstance(timer, dict):
+            try:
+                minutes = int(float(timer.get("minutes", 25)))
+            except (TypeError, ValueError):
+                minutes = 25
+            out["timer"] = {"minutes": min(180, max(1, minutes))}
+        quote = config.get("quote")
+        if isinstance(quote, dict):
+            try:
+                shift = int(float(quote.get("shift", 0)))
+            except (TypeError, ValueError):
+                shift = 0
+            out["quote"] = {"shift": min(999, max(0, shift))}
+    return result
+
+
+def http_get(url, limit=3_000_000, timeout=15):
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; FilipsBrowser/1.0)"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read(limit)
+
+
+def build_weather(place, data, unit):
+    """Turn Open-Meteo's answer into the small dictionary the weather widget shows."""
+    current = data["current"]
+    daily = data["daily"]
+    days = []
+    for index, day in enumerate(daily["time"]):
+        days.append(
+            {
+                "date": day,
+                "code": daily["weather_code"][index],
+                "max": daily["temperature_2m_max"][index],
+                "min": daily["temperature_2m_min"][index],
+            }
+        )
+    return {
+        "place": place.get("name", ""),
+        "country": place.get("country", ""),
+        "temp": current["temperature_2m"],
+        "feels": current["apparent_temperature"],
+        "humidity": current["relative_humidity_2m"],
+        "wind": current["wind_speed_10m"],
+        "code": current["weather_code"],
+        "unit": unit,
+        "days": days,
+    }
+
+
+def fetch_weather(city, unit):
+    """Look a city up and get its forecast from Open-Meteo (free, no account needed)."""
+    if not city.strip():
+        raise ValueError("Type a city first.")
+    geo = json.loads(
+        http_get(
+            "https://geocoding-api.open-meteo.com/v1/search?name="
+            + quote(city.strip())
+            + "&count=1&language=en&format=json"
+        )
+    )
+    results = geo.get("results") or []
+    if not results:
+        raise ValueError(f"No place called \"{city.strip()}\" was found.")
+    place = results[0]
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={place['latitude']}&longitude={place['longitude']}"
+        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min"
+        "&timezone=auto&forecast_days=4"
+    )
+    if unit == "f":
+        url += "&temperature_unit=fahrenheit&wind_speed_unit=mph"
+    return build_weather(place, json.loads(http_get(url)), unit)
+
+
+def parse_feed(data, limit=10):
+    """Read the headlines from an RSS or Atom feed."""
+    if re.search(rb"<!ENTITY", data, re.IGNORECASE):
+        raise ValueError("This feed uses features that aren't allowed.")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        raise ValueError("That address isn't an RSS or Atom news feed.")
+    items = []
+    for node in root.iter():
+        if node.tag.split("}")[-1] not in ("item", "entry"):
+            continue
+        title = link = published = ""
+        for child in node:
+            name = child.tag.split("}")[-1]
+            if name == "title":
+                title = " ".join((child.text or "").split())
+            elif name == "link":
+                href = child.get("href")
+                if href:
+                    if child.get("rel", "alternate") == "alternate":
+                        link = href
+                elif (child.text or "").strip():
+                    link = child.text.strip()
+            elif name in ("pubDate", "published", "updated") and not published:
+                published = (child.text or "").strip()
+        if title and link.startswith(("http://", "https://")):
+            items.append({"title": title[:200], "link": link, "time": published})
+        if len(items) >= limit:
+            break
+    if not items:
+        raise ValueError("No headlines were found in this feed.")
+    return items
+
+
+def fetch_news(source, custom):
+    if source == "custom":
+        url = custom.strip()
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("Enter a feed address that starts with http:// or https://")
+    else:
+        url = NEWS_SOURCES.get(source, NEWS_SOURCES["bbc"])[1]
+    return {"items": parse_feed(http_get(url))}
+
+
+class HomeDataWorker(QThread):
+    """Fetches weather or news for a home page widget without freezing the browser."""
+
+    done = Signal(object)
+
+    def __init__(self, job, view_id, kind, params):
+        super().__init__()
+        self.job = job
+        self.view_id = view_id
+        self.kind = kind
+        self.params = params
+
+    def run(self):
+        result = {"job": self.job, "view_id": self.view_id, "kind": self.kind}
+        try:
+            if self.kind == "weather":
+                result["data"] = fetch_weather(self.params["city"], self.params["unit"])
+            else:
+                result["data"] = fetch_news(self.params["source"], self.params["custom"])
+            result["ok"] = True
+        except ValueError as error:
+            result.update(ok=False, error=str(error))
+        except urllib.error.HTTPError as error:
+            result.update(ok=False, error=f"The service refused the request (error {error.code}).")
+        except urllib.error.URLError:
+            result.update(ok=False, error="Couldn't connect. Check your internet connection.")
+        except (KeyError, IndexError, TypeError):
+            result.update(ok=False, error="The service sent an answer that couldn't be read.")
+        except Exception as error:
+            result.update(ok=False, error=f"Couldn't load this: {error}")
+        self.done.emit(result)
+
+
+WIDGET_CSS = r"""
+#fw-layer { position: fixed; inset: 0; pointer-events: none; z-index: 5; }
+.fw-card {
+  position: absolute; pointer-events: auto; box-sizing: border-box; max-width: 92vw;
+  background: rgba(14, 16, 26, 0.62);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  color: #e8eaf0; font-size: 14px; text-align: left;
+}
+.fw-in { animation: fwIn 0.35s ease-out backwards; }
+@keyframes fwIn { from { opacity: 0; transform: scale(0.94) translateY(8px); } to { opacity: 1; transform: none; } }
+.fw-dragging { opacity: 0.92; box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5); }
+.fw-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 9px 12px; cursor: grab; user-select: none; font-weight: 600;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.fw-dragging .fw-head { cursor: grabbing; }
+.fw-x {
+  width: 22px; height: 22px; border: none; border-radius: 50%; padding: 0;
+  background: none; color: #aab0c0; cursor: pointer; font-size: 12px; opacity: 0.6;
+  transition: opacity 0.2s, background 0.2s;
+}
+.fw-x:hover { opacity: 1; background: rgba(230, 60, 60, 0.85); color: #fff; }
+.fw-body { padding: 12px; }
+.fw-time { font-size: 34px; font-weight: 300; letter-spacing: 1px; }
+.fw-small { font-size: 12px; color: #9aa3b5; }
+.fw-error { color: #ff9b9b; font-size: 13px; }
+.fw-foot { display: flex; justify-content: space-between; margin-top: 8px; }
+#fw-layer form, #fw-layer .fw-form { display: flex; gap: 6px; width: auto; animation: none; margin: 0 0 8px 0; }
+#fw-layer .fw-input, #fw-layer select, #fw-layer textarea {
+  flex: 1; width: 100%; min-width: 0; box-sizing: border-box; padding: 7px 10px;
+  border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.08); color: inherit; font: inherit; font-size: 13px; outline: none;
+}
+#fw-layer select option { color: #111; }
+#fw-layer .fw-input:focus, #fw-layer textarea:focus { border-color: #6ea8ff; box-shadow: none; }
+#fw-layer input[type="checkbox"], #fw-panel input[type="checkbox"] {
+  width: 16px; height: 16px; flex: none; padding: 0; margin: 0; border-radius: 4px; box-shadow: none; accent-color: #6ea8ff;
+}
+.fw-btn {
+  padding: 6px 12px; border-radius: 9px; border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(110, 168, 255, 0.28); color: #fff; cursor: pointer; font: inherit; font-size: 13px;
+  transition: background 0.2s, transform 0.2s;
+}
+.fw-btn:hover { background: rgba(110, 168, 255, 0.5); transform: translateY(-1px); }
+.fw-link { background: none; border: none; color: #8fb8ff; cursor: pointer; padding: 2px 4px; font: inherit; font-size: 12px; }
+.fw-link:hover { text-decoration: underline; }
+.fw-wtop { display: flex; align-items: center; gap: 12px; }
+.fw-wicon { font-size: 44px; }
+.fw-wtemp { font-size: 34px; font-weight: 300; }
+.fw-wplace { margin: 6px 0 2px; font-weight: 600; }
+.fw-days { display: flex; gap: 8px; margin-top: 10px; }
+.fw-day { flex: 1; text-align: center; padding: 6px 4px; border-radius: 10px; background: rgba(255, 255, 255, 0.06); }
+.fw-dayicon { font-size: 22px; }
+.fw-news { max-height: 300px; overflow-y: auto; margin-top: 8px; scrollbar-width: thin; }
+.fw-news-item {
+  display: flex; flex-direction: column; gap: 2px; padding: 8px 6px; border-radius: 8px;
+  color: inherit; text-decoration: none; border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  transition: background 0.2s;
+}
+.fw-news-item:hover { background: rgba(255, 255, 255, 0.08); }
+.fw-news-title { font-size: 13px; line-height: 1.35; }
+.fw-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; scrollbar-width: thin; }
+.fw-item {
+  display: block; padding: 6px 8px; border-radius: 8px; color: #cfd6e6; text-decoration: none;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: background 0.2s;
+}
+a.fw-item:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.fw-current { color: #fff; font-weight: 600; }
+.fw-todo { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+.fw-todo-text { flex: 1; word-break: break-word; }
+.fw-done .fw-todo-text { text-decoration: line-through; opacity: 0.55; }
+#fw-layer textarea.fw-notes { min-height: 130px; resize: vertical; }
+.fw-calc-screen {
+  text-align: right; font-size: 28px; padding: 6px 10px; margin-bottom: 8px;
+  background: rgba(0, 0, 0, 0.25); border-radius: 9px; overflow: hidden;
+}
+.fw-calc-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.fw-key {
+  padding: 9px 0; border: none; border-radius: 9px; background: rgba(255, 255, 255, 0.1);
+  color: #fff; font: inherit; font-size: 16px; cursor: pointer; transition: background 0.15s, transform 0.1s;
+}
+.fw-key:hover { background: rgba(255, 255, 255, 0.2); }
+.fw-key:active { transform: scale(0.95); }
+.fw-wide { grid-column: span 2; }
+.fw-quote { font-size: 15px; line-height: 1.45; font-style: italic; }
+.fw-quote-by { text-align: right; margin: 6px 0 4px; }
+.fw-toggle {
+  position: fixed; right: 18px; bottom: 18px; z-index: 30; padding: 10px 16px; border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.15); background: rgba(14, 16, 26, 0.7); color: #e8eaf0;
+  cursor: pointer; font: inherit; font-size: 14px; -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  transition: transform 0.2s, background 0.2s;
+}
+.fw-toggle:hover { transform: translateY(-2px); background: rgba(110, 168, 255, 0.4); }
+.fw-panel {
+  position: fixed; right: 18px; bottom: 68px; z-index: 30; width: 250px; max-height: 70vh; overflow-y: auto;
+  padding: 12px; box-sizing: border-box; border-radius: 16px; color: #e8eaf0; font-size: 14px; text-align: left;
+  background: rgba(14, 16, 26, 0.88); border: 1px solid rgba(255, 255, 255, 0.12);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  animation: fwIn 0.25s ease-out backwards;
+}
+.fw-panel[hidden] { display: none !important; }
+.fw-panel-title { font-weight: 600; margin-bottom: 8px; }
+.fw-panel-row { display: flex; align-items: center; gap: 10px; padding: 5px 4px; border-radius: 8px; cursor: pointer; }
+.fw-panel-row:hover { background: rgba(255, 255, 255, 0.08); }
+.fw-panel .fw-btn { margin: 8px 0 6px; width: 100%; }
+"""
+
+WIDGET_JS = r"""
+(function () {
+  "use strict";
+  var BOOT = window.FILIPS_HOME;
+  if (!BOOT) return;
+  var state = BOOT.state;
+  if (!state.enabled) state.enabled = [];
+  if (!state.pos) state.pos = {};
+  if (!state.config) state.config = {};
+
+  // ---------- helpers ----------
+  function send(action, data) {
+    console.log("__filips_home__:" + JSON.stringify({t: BOOT.token, a: action, d: data}));
+  }
+  var saveTimer = null;
+  function save() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () { send("state", state); }, 400);
+  }
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+  function cfgFor(id) {
+    if (!state.config[id]) state.config[id] = {};
+    return state.config[id];
+  }
+  function ago(value) {
+    var t = Date.parse(value);
+    if (isNaN(t)) return "";
+    var mins = Math.round((Date.now() - t) / 60000);
+    if (mins < 1) return "just now";
+    if (mins < 60) return mins + " min ago";
+    var hours = Math.round(mins / 60);
+    if (hours < 24) return hours + " h ago";
+    return Math.round(hours / 24) + " d ago";
+  }
+
+  var WEATHER = {
+    0: ["Clear sky", "\u2600\uFE0F"], 1: ["Mainly clear", "\uD83C\uDF24\uFE0F"], 2: ["Partly cloudy", "\u26C5"],
+    3: ["Overcast", "\u2601\uFE0F"], 45: ["Fog", "\uD83C\uDF2B\uFE0F"], 48: ["Rime fog", "\uD83C\uDF2B\uFE0F"],
+    51: ["Light drizzle", "\uD83C\uDF26\uFE0F"], 53: ["Drizzle", "\uD83C\uDF26\uFE0F"], 55: ["Heavy drizzle", "\uD83C\uDF27\uFE0F"],
+    56: ["Freezing drizzle", "\uD83C\uDF27\uFE0F"], 57: ["Freezing drizzle", "\uD83C\uDF27\uFE0F"],
+    61: ["Light rain", "\uD83C\uDF26\uFE0F"], 63: ["Rain", "\uD83C\uDF27\uFE0F"], 65: ["Heavy rain", "\uD83C\uDF27\uFE0F"],
+    66: ["Freezing rain", "\uD83C\uDF27\uFE0F"], 67: ["Freezing rain", "\uD83C\uDF27\uFE0F"],
+    71: ["Light snow", "\uD83C\uDF28\uFE0F"], 73: ["Snow", "\uD83C\uDF28\uFE0F"], 75: ["Heavy snow", "\u2744\uFE0F"],
+    77: ["Snow grains", "\u2744\uFE0F"], 80: ["Rain showers", "\uD83C\uDF26\uFE0F"], 81: ["Rain showers", "\uD83C\uDF27\uFE0F"],
+    82: ["Violent showers", "\u26C8\uFE0F"], 85: ["Snow showers", "\uD83C\uDF28\uFE0F"], 86: ["Snow showers", "\uD83C\uDF28\uFE0F"],
+    95: ["Thunderstorm", "\u26C8\uFE0F"], 96: ["Thunderstorm with hail", "\u26C8\uFE0F"], 99: ["Thunderstorm with hail", "\u26C8\uFE0F"]
+  };
+  function weatherInfo(code) { return WEATHER[code] || ["Unknown", "\uD83C\uDF21\uFE0F"]; }
+
+  var QUOTES = [
+    ["A journey of a thousand miles begins with a single step.", "Lao Tzu"],
+    ["Well begun is half done.", "Aristotle"],
+    ["The unexamined life is not worth living.", "Socrates"],
+    ["Fortune favors the bold.", "Virgil"],
+    ["Energy and persistence conquer all things.", "Benjamin Franklin"],
+    ["The best way out is always through.", "Robert Frost"],
+    ["Nothing in life is to be feared, it is only to be understood.", "Marie Curie"],
+    ["No man ever steps in the same river twice.", "Heraclitus"],
+    ["Great things are done by a series of small things brought together.", "Vincent van Gogh"]
+  ];
+
+  // ---------- the widgets ----------
+  function buildClock(body) {
+    var time = el("div", "fw-time");
+    var date = el("div", "fw-small");
+    body.appendChild(time);
+    body.appendChild(date);
+    function tick() {
+      var now = new Date();
+      time.textContent = now.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+      date.textContent = now.toLocaleDateString([], {weekday: "long", day: "numeric", month: "long", year: "numeric"});
+    }
+    tick();
+    var timer = setInterval(tick, 1000);
+    return {destroy: function () { clearInterval(timer); }};
+  }
+
+  function buildWeather(body, ctx) {
+    var cfg = ctx.cfg;
+    if (!cfg.unit) cfg.unit = "c";
+    if (!cfg.city) cfg.city = "";
+    var form = el("form", "fw-form");
+    var input = el("input", "fw-input");
+    input.placeholder = "City, e.g. Athens";
+    input.maxLength = 80;
+    input.value = cfg.city;
+    var go = el("button", "fw-btn", "Go");
+    go.type = "submit";
+    form.appendChild(input);
+    form.appendChild(go);
+    var out = el("div", "fw-weather");
+    var foot = el("div", "fw-foot");
+    var unitButton = el("button", "fw-link");
+    unitButton.type = "button";
+    var refresh = el("button", "fw-link", "Refresh");
+    refresh.type = "button";
+    foot.appendChild(unitButton);
+    foot.appendChild(refresh);
+    body.appendChild(form);
+    body.appendChild(out);
+    body.appendChild(foot);
+
+    function unitLabel() { unitButton.textContent = cfg.unit === "f" ? "Show \u00B0C" : "Show \u00B0F"; }
+    function load() {
+      if (!cfg.city) { out.textContent = "Type your city above to see the weather."; return; }
+      out.textContent = "Loading\u2026";
+      send("fetch", {kind: "weather", city: cfg.city, unit: cfg.unit});
+    }
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      cfg.city = input.value.trim();
+      ctx.save();
+      load();
+    });
+    unitButton.addEventListener("click", function () {
+      cfg.unit = cfg.unit === "f" ? "c" : "f";
+      ctx.save();
+      unitLabel();
+      load();
+    });
+    refresh.addEventListener("click", load);
+    var timer = setInterval(load, 30 * 60 * 1000);
+    unitLabel();
+    load();
+
+    return {
+      kind: "weather",
+      destroy: function () { clearInterval(timer); },
+      onData: function (payload) {
+        out.textContent = "";
+        if (!payload.ok) { out.appendChild(el("div", "fw-error", payload.error)); return; }
+        var d = payload.data;
+        var info = weatherInfo(d.code);
+        var deg = d.unit === "f" ? "\u00B0F" : "\u00B0C";
+        var top = el("div", "fw-wtop");
+        top.appendChild(el("div", "fw-wicon", info[1]));
+        var main = el("div");
+        main.appendChild(el("div", "fw-wtemp", Math.round(d.temp) + deg));
+        main.appendChild(el("div", "fw-small", info[0]));
+        top.appendChild(main);
+        out.appendChild(top);
+        out.appendChild(el("div", "fw-wplace", d.place + (d.country ? ", " + d.country : "")));
+        out.appendChild(el("div", "fw-small",
+          "Feels like " + Math.round(d.feels) + deg + "  \u00B7  Humidity " + d.humidity + "%  \u00B7  Wind " +
+          Math.round(d.wind) + (d.unit === "f" ? " mph" : " km/h")));
+        var days = el("div", "fw-days");
+        d.days.slice(1).forEach(function (day) {
+          var box = el("div", "fw-day");
+          var name = new Date(day.date + "T12:00:00").toLocaleDateString([], {weekday: "short"});
+          box.appendChild(el("div", "fw-small", name));
+          box.appendChild(el("div", "fw-dayicon", weatherInfo(day.code)[1]));
+          box.appendChild(el("div", "fw-small", Math.round(day.max) + "\u00B0 / " + Math.round(day.min) + "\u00B0"));
+          days.appendChild(box);
+        });
+        out.appendChild(days);
+      }
+    };
+  }
+
+  function buildNews(body, ctx) {
+    var cfg = ctx.cfg;
+    if (!cfg.source) cfg.source = "bbc";
+    if (!cfg.custom) cfg.custom = "";
+    var select = el("select", "fw-input");
+    BOOT.newsSources.forEach(function (source) {
+      var option = el("option", "", source.name);
+      option.value = source.id;
+      select.appendChild(option);
+    });
+    var own = el("option", "", "My own RSS feed\u2026");
+    own.value = "custom";
+    select.appendChild(own);
+    select.value = cfg.source;
+    var customInput = el("input", "fw-input");
+    customInput.placeholder = "https://example.com/feed.xml";
+    customInput.value = cfg.custom;
+    var list = el("div", "fw-news");
+    body.appendChild(select);
+    body.appendChild(customInput);
+    body.appendChild(list);
+
+    function syncCustom() { customInput.style.display = select.value === "custom" ? "" : "none"; }
+    function canLoad() { return cfg.source !== "custom" || !!cfg.custom; }
+    function load() {
+      if (!canLoad()) { list.textContent = "Paste a feed address above."; return; }
+      list.textContent = "Loading\u2026";
+      send("fetch", {kind: "news", source: cfg.source, custom: cfg.custom});
+    }
+    select.addEventListener("change", function () {
+      cfg.source = select.value;
+      ctx.save();
+      syncCustom();
+      load();
+    });
+    customInput.addEventListener("change", function () {
+      cfg.custom = customInput.value.trim();
+      ctx.save();
+      load();
+    });
+    var timer = setInterval(load, 15 * 60 * 1000);
+    syncCustom();
+    load();
+
+    return {
+      kind: "news",
+      destroy: function () { clearInterval(timer); },
+      onData: function (payload) {
+        list.textContent = "";
+        if (!payload.ok) { list.appendChild(el("div", "fw-error", payload.error)); return; }
+        payload.data.items.forEach(function (item) {
+          var link = el("a", "fw-news-item");
+          link.href = item.link;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.appendChild(el("span", "fw-news-title", item.title));
+          var when = ago(item.time);
+          if (when) link.appendChild(el("span", "fw-small", when));
+          list.appendChild(link);
+        });
+      }
+    };
+  }
+
+  function buildProfiles(body) {
+    var list = el("div", "fw-list");
+    BOOT.profiles.all.forEach(function (name) {
+      if (name === BOOT.profiles.current) {
+        list.appendChild(el("div", "fw-item fw-current", "\u25CF  " + name + "  (this window)"));
+      } else {
+        var link = el("a", "fw-item", "\u25CB  " + name);
+        link.href = "browser://openprofile?name=" + encodeURIComponent(name);
+        list.appendChild(link);
+      }
+    });
+    var add = el("a", "fw-item", "\uFF0B  New profile");
+    add.href = "browser://newprofile";
+    list.appendChild(add);
+    body.appendChild(list);
+    return {};
+  }
+
+  function buildNotes(body, ctx) {
+    var area = el("textarea", "fw-notes");
+    area.placeholder = "Write a note\u2026";
+    area.maxLength = 5000;
+    area.value = ctx.cfg.text || "";
+    area.addEventListener("input", function () {
+      ctx.cfg.text = area.value;
+      ctx.save();
+    });
+    body.appendChild(area);
+    return {};
+  }
+
+  function buildTodo(body, ctx) {
+    var cfg = ctx.cfg;
+    if (!Array.isArray(cfg.items)) cfg.items = [];
+    var form = el("form", "fw-form");
+    var input = el("input", "fw-input");
+    input.placeholder = "Add a task";
+    input.maxLength = 200;
+    var add = el("button", "fw-btn", "+");
+    add.type = "submit";
+    form.appendChild(input);
+    form.appendChild(add);
+    var list = el("div", "fw-list");
+    body.appendChild(form);
+    body.appendChild(list);
+
+    function render() {
+      list.textContent = "";
+      cfg.items.forEach(function (item, index) {
+        var row = el("label", "fw-todo" + (item.d ? " fw-done" : ""));
+        var box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = !!item.d;
+        box.addEventListener("change", function () { item.d = box.checked; ctx.save(); render(); });
+        var del = el("button", "fw-x", "\u2715");
+        del.type = "button";
+        del.title = "Delete";
+        del.addEventListener("click", function (e) {
+          e.preventDefault();
+          cfg.items.splice(index, 1);
+          ctx.save();
+          render();
+        });
+        row.appendChild(box);
+        row.appendChild(el("span", "fw-todo-text", item.t));
+        row.appendChild(del);
+        list.appendChild(row);
+      });
+      if (!cfg.items.length) list.appendChild(el("div", "fw-small", "Nothing to do. Enjoy!"));
+    }
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var text = input.value.trim();
+      if (!text || cfg.items.length >= 50) return;
+      cfg.items.push({t: text.slice(0, 200), d: false});
+      input.value = "";
+      ctx.save();
+      render();
+    });
+    render();
+    return {};
+  }
+
+  function linkList(items, emptyText) {
+    var list = el("div", "fw-list");
+    if (!items.length) list.appendChild(el("div", "fw-small", emptyText));
+    items.forEach(function (item) {
+      var link = el("a", "fw-item", item.title || item.url);
+      link.href = item.url;
+      link.title = item.url;
+      list.appendChild(link);
+    });
+    return list;
+  }
+  function buildBookmarks(body) {
+    body.appendChild(linkList(BOOT.bookmarks, "No bookmarks yet. Press Ctrl+D on a page."));
+    return {};
+  }
+  function buildHistory(body) {
+    body.appendChild(linkList(BOOT.history, "Pages you visit will show up here."));
+    return {};
+  }
+
+  function buildCalculator(body) {
+    var screen = el("div", "fw-calc-screen", "0");
+    var grid = el("div", "fw-calc-grid");
+    var acc = null, op = null, cur = "0", fresh = true;
+    function compute() {
+      var value = parseFloat(cur);
+      if (acc === null || op === null) { acc = value; return; }
+      if (op === "+") acc += value;
+      else if (op === "\u2212") acc -= value;
+      else if (op === "\u00D7") acc *= value;
+      else if (op === "\u00F7") acc = value === 0 ? NaN : acc / value;
+      cur = isFinite(acc) ? String(parseFloat(acc.toPrecision(12))) : "Error";
+    }
+    function press(key) {
+      if (cur === "Error") { acc = null; op = null; cur = "0"; fresh = true; }
+      if (/^[0-9]$/.test(key)) {
+        cur = (fresh || cur === "0") ? key : cur + key;
+        fresh = false;
+      } else if (key === ".") {
+        if (fresh) { cur = "0."; fresh = false; } else if (cur.indexOf(".") < 0) { cur += "."; }
+      } else if (key === "C") {
+        acc = null; op = null; cur = "0"; fresh = true;
+      } else if (key === "\u232B") {
+        if (!fresh) cur = cur.length > 1 ? cur.slice(0, -1) : "0";
+      } else if (key === "=") {
+        compute(); op = null; fresh = true;
+      } else {
+        compute(); op = key; fresh = true;
+      }
+      screen.textContent = cur;
+    }
+    ["C", "\u232B", "\u00F7", "\u00D7", "7", "8", "9", "\u2212", "4", "5", "6", "+", "1", "2", "3", "=", "0", "."]
+      .forEach(function (key) {
+        var button = el("button", "fw-key" + (key === "0" ? " fw-wide" : ""), key);
+        button.type = "button";
+        button.addEventListener("click", function () { press(key); });
+        grid.appendChild(button);
+      });
+    body.appendChild(screen);
+    body.appendChild(grid);
+    return {};
+  }
+
+  function buildTimer(body, ctx) {
+    var cfg = ctx.cfg;
+    if (!cfg.minutes) cfg.minutes = 25;
+    var display = el("div", "fw-time");
+    var row = el("div", "fw-form");
+    var minutes = el("input", "fw-input");
+    minutes.type = "number";
+    minutes.min = "1";
+    minutes.max = "180";
+    minutes.value = cfg.minutes;
+    var start = el("button", "fw-btn", "Start");
+    start.type = "button";
+    var reset = el("button", "fw-btn", "Reset");
+    reset.type = "button";
+    row.appendChild(minutes);
+    row.appendChild(start);
+    row.appendChild(reset);
+    body.appendChild(display);
+    body.appendChild(el("div", "fw-small", "Minutes:"));
+    body.appendChild(row);
+
+    var remaining = cfg.minutes * 60;
+    var ticking = null;
+    function show() {
+      var m = Math.floor(remaining / 60), s = remaining % 60;
+      display.textContent = (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+    }
+    function stop() {
+      if (ticking) { clearInterval(ticking); ticking = null; }
+      start.textContent = "Start";
+    }
+    function beep() {
+      try {
+        var audio = new (window.AudioContext || window.webkitAudioContext)();
+        var tone = audio.createOscillator();
+        tone.connect(audio.destination);
+        tone.frequency.value = 880;
+        tone.start();
+        setTimeout(function () { tone.stop(); audio.close(); }, 500);
+      } catch (err) {}
+    }
+    start.addEventListener("click", function () {
+      if (ticking) { stop(); return; }
+      if (remaining <= 0) remaining = cfg.minutes * 60;
+      start.textContent = "Pause";
+      ticking = setInterval(function () {
+        remaining -= 1;
+        show();
+        if (remaining <= 0) { stop(); display.textContent = "Time's up!"; beep(); }
+      }, 1000);
+    });
+    reset.addEventListener("click", function () { stop(); remaining = cfg.minutes * 60; show(); });
+    minutes.addEventListener("change", function () {
+      var value = Math.min(180, Math.max(1, parseInt(minutes.value, 10) || 25));
+      cfg.minutes = value;
+      minutes.value = value;
+      ctx.save();
+      stop();
+      remaining = value * 60;
+      show();
+    });
+    show();
+    return {destroy: function () { if (ticking) clearInterval(ticking); }};
+  }
+
+  function buildQuote(body, ctx) {
+    var cfg = ctx.cfg;
+    var text = el("div", "fw-quote");
+    var by = el("div", "fw-small fw-quote-by");
+    var another = el("button", "fw-link", "Another one");
+    another.type = "button";
+    body.appendChild(text);
+    body.appendChild(by);
+    body.appendChild(another);
+    function show() {
+      var day = Math.floor(Date.now() / 86400000);
+      var quote = QUOTES[(day + (cfg.shift || 0)) % QUOTES.length];
+      text.textContent = "\u201C" + quote[0] + "\u201D";
+      by.textContent = "\u2014 " + quote[1];
+    }
+    another.addEventListener("click", function () {
+      cfg.shift = ((cfg.shift || 0) + 1) % 1000;
+      ctx.save();
+      show();
+    });
+    show();
+    return {};
+  }
+
+  var WIDGETS = [
+    {id: "clock", name: "Clock", icon: "\uD83D\uDD52", w: 250, pos: {x: 0.03, y: 0.07}, build: buildClock},
+    {id: "weather", name: "Weather", icon: "\u26C5", w: 290, pos: {x: 0.03, y: 0.26}, build: buildWeather},
+    {id: "news", name: "News", icon: "\uD83D\uDCF0", w: 340, pos: {x: 0.69, y: 0.07}, build: buildNews},
+    {id: "profiles", name: "Profiles", icon: "\uD83D\uDC64", w: 230, pos: {x: 0.03, y: 0.68}, build: buildProfiles},
+    {id: "notes", name: "Notes", icon: "\uD83D\uDCDD", w: 260, pos: {x: 0.72, y: 0.62}, build: buildNotes},
+    {id: "todo", name: "To-do list", icon: "\u2705", w: 270, pos: {x: 0.72, y: 0.38}, build: buildTodo},
+    {id: "bookmarks", name: "Bookmarks", icon: "\u2B50", w: 250, pos: {x: 0.23, y: 0.68}, build: buildBookmarks},
+    {id: "history", name: "Recently visited", icon: "\uD83D\uDD58", w: 250, pos: {x: 0.43, y: 0.68}, build: buildHistory},
+    {id: "calculator", name: "Calculator", icon: "\uD83E\uDDEE", w: 220, pos: {x: 0.23, y: 0.07}, build: buildCalculator},
+    {id: "timer", name: "Timer", icon: "\u23F1\uFE0F", w: 240, pos: {x: 0.45, y: 0.07}, build: buildTimer},
+    {id: "quote", name: "Daily quote", icon: "\uD83D\uDCAC", w: 280, pos: {x: 0.45, y: 0.3}, build: buildQuote}
+  ];
+  var byId = {};
+  WIDGETS.forEach(function (def) { byId[def.id] = def; });
+
+  // ---------- layer, placing and dragging ----------
+  var layer = el("div");
+  layer.id = "fw-layer";
+  document.body.appendChild(layer);
+  var live = {};
+  var topZ = 10;
+
+  function defaultPos(id) {
+    var x = byId[id].pos.x, y = byId[id].pos.y, tries = 0;
+    function clash() {
+      return Object.keys(live).some(function (other) {
+        if (other === id) return false;
+        var p = state.pos[other] || byId[other].pos;
+        return Math.abs(p.x - x) < 0.02 && Math.abs(p.y - y) < 0.03;
+      });
+    }
+    while (clash() && tries < 12) { x = Math.min(0.9, x + 0.03); y = Math.min(0.9, y + 0.05); tries++; }
+    return {x: x, y: y};
+  }
+
+  function place(id) {
+    var item = live[id];
+    if (!item) return;
+    var pos = state.pos[id];
+    if (!pos) { pos = defaultPos(id); state.pos[id] = pos; save(); }
+    var node = item.el;
+    var maxX = Math.max(0, window.innerWidth - node.offsetWidth);
+    var maxY = Math.max(0, window.innerHeight - node.offsetHeight);
+    node.style.left = Math.min(maxX, Math.max(0, pos.x * window.innerWidth)) + "px";
+    node.style.top = Math.min(maxY, Math.max(0, pos.y * window.innerHeight)) + "px";
+  }
+
+  function makeDraggable(node, handle, id) {
+    handle.addEventListener("pointerdown", function (event) {
+      if (event.button !== 0 || (event.target.closest && event.target.closest("button"))) return;
+      var rect = node.getBoundingClientRect();
+      var dx = event.clientX - rect.left, dy = event.clientY - rect.top;
+      node.style.zIndex = ++topZ;
+      node.classList.add("fw-dragging");
+      handle.setPointerCapture(event.pointerId);
+      function move(e) {
+        var x = Math.min(Math.max(0, e.clientX - dx), Math.max(0, window.innerWidth - node.offsetWidth));
+        var y = Math.min(Math.max(0, e.clientY - dy), Math.max(0, window.innerHeight - node.offsetHeight));
+        node.style.left = x + "px";
+        node.style.top = y + "px";
+      }
+      function up(e) {
+        handle.removeEventListener("pointermove", move);
+        handle.removeEventListener("pointerup", up);
+        handle.removeEventListener("pointercancel", up);
+        try { handle.releasePointerCapture(e.pointerId); } catch (err) {}
+        node.classList.remove("fw-dragging");
+        state.pos[id] = {x: node.offsetLeft / window.innerWidth, y: node.offsetTop / window.innerHeight};
+        save();
+      }
+      handle.addEventListener("pointermove", move);
+      handle.addEventListener("pointerup", up);
+      handle.addEventListener("pointercancel", up);
+      event.preventDefault();
+    });
+  }
+
+  function createWidget(def) {
+    var root = el("div", "fw-card fw-in");
+    root.style.width = def.w + "px";
+    var head = el("div", "fw-head");
+    head.appendChild(el("span", "fw-title", def.icon + "  " + def.name));
+    var close = el("button", "fw-x", "\u2715");
+    close.type = "button";
+    close.title = "Remove this widget";
+    head.appendChild(close);
+    var body = el("div", "fw-body");
+    root.appendChild(head);
+    root.appendChild(body);
+    layer.appendChild(root);
+    var api = def.build(body, {cfg: cfgFor(def.id), save: save}) || {};
+    live[def.id] = {el: root, api: api};
+    place(def.id);
+    makeDraggable(root, head, def.id);
+    root.addEventListener("pointerdown", function () { root.style.zIndex = ++topZ; });
+    close.addEventListener("click", function () { setEnabled(def.id, false); });
+  }
+
+  function setEnabled(id, on) {
+    var index = state.enabled.indexOf(id);
+    if (on && index < 0) {
+      state.enabled.push(id);
+      createWidget(byId[id]);
+    }
+    if (!on && index >= 0) {
+      state.enabled.splice(index, 1);
+      var item = live[id];
+      if (item) {
+        if (item.api.destroy) item.api.destroy();
+        item.el.remove();
+        delete live[id];
+      }
+    }
+    renderPanel();
+    save();
+  }
+
+  // ---------- the "Widgets" button and its list ----------
+  var toggle = el("button", "fw-toggle", "\u229E  Widgets");
+  toggle.type = "button";
+  var panel = el("div", "fw-panel");
+  panel.hidden = true;
+  document.body.appendChild(toggle);
+  document.body.appendChild(panel);
+  toggle.addEventListener("click", function () { panel.hidden = !panel.hidden; });
+
+  function renderPanel() {
+    panel.textContent = "";
+    panel.appendChild(el("div", "fw-panel-title", "Widgets"));
+    WIDGETS.forEach(function (def) {
+      var row = el("label", "fw-panel-row");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = state.enabled.indexOf(def.id) >= 0;
+      box.addEventListener("change", function () { setEnabled(def.id, box.checked); });
+      row.appendChild(box);
+      row.appendChild(el("span", "", def.icon + "  " + def.name));
+      panel.appendChild(row);
+    });
+    var reset = el("button", "fw-btn", "Reset positions");
+    reset.type = "button";
+    reset.addEventListener("click", function () {
+      state.pos = {};
+      Object.keys(live).forEach(function (id) { place(id); });
+      save();
+    });
+    panel.appendChild(reset);
+    panel.appendChild(el("div", "fw-small", "Drag a widget by its title bar to move it."));
+  }
+
+  // data that Python fetched for us (weather, news)
+  window.filipsData = function (kind, payload) {
+    Object.keys(live).forEach(function (id) {
+      var api = live[id].api;
+      if (api.kind === kind && api.onData) api.onData(payload);
+    });
+  };
+
+  window.addEventListener("resize", function () {
+    Object.keys(live).forEach(function (id) { place(id); });
+  });
+
+  state.enabled.slice().forEach(function (id) {
+    if (byId[id]) createWidget(byId[id]);
+  });
+  renderPanel();
+})();
+"""
+
+
 class BrowserPage(QWebEnginePage):
     """The web page inside a tab. Handles two special cases:
     - links that want a new window open in a new tab
@@ -1165,6 +2385,9 @@ class BrowserPage(QWebEnginePage):
         return self.main_window.add_tab(home=False).page()
 
     def javaScriptConsoleMessage(self, level, message, line_number, source_id):
+        if message.startswith(HOME_PREFIX):
+            self.main_window.on_home_message(self.view_ref, message[len(HOME_PREFIX):])
+            return
         if message.startswith(PASSWORD_PREFIX):
             # A login was typed in (see PASSWORD_SCRIPT). Never print it anywhere.
             self.main_window.on_password_message(self, message[len(PASSWORD_PREFIX):])
@@ -1179,6 +2402,8 @@ class BrowserView(QWebEngineView):
         super().__init__()
         self.main_window = main_window
         self.showing_home = False
+        self.loading = False
+        self.progress = 0
         self.setPage(BrowserPage(main_window.profile, self, main_window))
 
 
@@ -1583,9 +2808,8 @@ class SideBar(QFrame):
                 item.widget().deleteLater()
         self.buttons = {}
         for service in services:
-            button = QToolButton()
+            button = AnimatedToolButton()
             button.setIcon(make_icon(service))
-            button.setIconSize(QSize(30, 30))
             button.setToolTip(service["name"])
             button.setCheckable(True)
             button.setChecked(service["id"] == active_id)
@@ -2256,6 +3480,10 @@ class AppearanceDialog(QDialog):
         close_button.clicked.connect(self.close)
 
         layout = QVBoxLayout(self)
+        animations_box = QCheckBox("Use animations")
+        animations_box.setChecked(self.browser.settings.get("animations", True))
+        animations_box.toggled.connect(lambda on: self.browser.set_setting("animations", on))
+        layout.addWidget(animations_box)
         layout.addWidget(QLabel("<b>Font</b>"))
         layout.addWidget(self.default_font_box)
         layout.addLayout(font_form)
@@ -2425,6 +3653,10 @@ class Browser(QMainWindow):
         self.bookmarks_window = None
         self.passwords_window = None
         self.appearance_dialog = None
+        self.ext_manager = None
+        self.ext_worker = None
+        self.home_workers = {}
+        self.home_job = 0
         if incognito:
             self.setWindowTitle(f"{APP_NAME} Incognito")
             self.setStyleSheet(INCOGNITO_STYLE)
@@ -2433,11 +3665,20 @@ class Browser(QMainWindow):
             self.setWindowTitle(f"{APP_NAME} {APP_VERSION}{suffix}")
         self.resize(1200, 800)
 
-        self.tabs = QTabWidget()
+        self.tabs = BrowserTabs()
         self.tabs.setDocumentMode(True)
-        self.tabs.setTabsClosable(True)
+        self.tabs.setTabsClosable(False)  # every tab gets its own, bigger close button instead
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.currentChanged.connect(self.on_tab_changed)
+
+        new_tab_button = QToolButton()
+        new_tab_button.setText("+")
+        new_tab_button.setToolTip("New tab (Ctrl+T)")
+        new_tab_button.setFixedSize(40, 40)
+        new_tab_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_tab_button.setStyleSheet(NEW_TAB_BUTTON_STYLE)
+        new_tab_button.clicked.connect(lambda: self.add_tab())
+        self.tabs.setCornerWidget(new_tab_button, Qt.Corner.TopRightCorner)
 
         # Sidebar (left), site panel (opens next to it), and the tabs
         self.sidebar = SideBar()
@@ -2451,17 +3692,35 @@ class Browser(QMainWindow):
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setChildrenCollapsible(False)
-        container = QWidget()
-        row = QHBoxLayout(container)
+        body = QWidget()
+        row = QHBoxLayout(body)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(0)
         row.addWidget(self.sidebar)
         row.addWidget(self.splitter)
-        self.setCentralWidget(container)
+
+        # A thin bar that fills while a page loads
+        self.load_bar = QProgressBar()
+        self.load_bar.setRange(0, 100)
+        self.load_bar.setTextVisible(False)
+        self.load_bar.setFixedHeight(3)
+        self.load_bar.setStyleSheet(LOAD_BAR_STYLE)
+        self.load_bar.hide()
+        self.bar_animation = None
+        self.panel_animation = None
+        self.panel_closing = False
+        outer = QWidget()
+        column = QVBoxLayout(outer)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(self.load_bar)
+        column.addWidget(body)
+        self.setCentralWidget(outer)
 
         # Toolbar: back, forward, reload, home, address bar, new tab, settings
         toolbar = QToolBar()
         toolbar.setMovable(False)
+        toolbar.setStyleSheet(TOOLBAR_STYLE)
         self.addToolBar(toolbar)
 
         back = QAction("←", self)
@@ -2507,7 +3766,7 @@ class Browser(QMainWindow):
         # Status bar shows how many requests were blocked
         self.blocked_label = QLabel("Blocked: 0")
         self.statusBar().addPermanentWidget(self.blocked_label)
-        blocker.counter.changed.connect(
+        self.blocker.counter.changed.connect(
             lambda n: self.blocked_label.setText(f"Blocked: {n}")
         )
 
@@ -2550,6 +3809,7 @@ class Browser(QMainWindow):
         self.apply_settings()
 
     def apply_settings(self):
+        set_animations(self.settings.get("animations", True))
         self.apply_appearance()
         self.blocker.block_ads = self.settings.get("block_ads", True)
         self.blocker.block_trackers = self.settings.get("block_trackers", True)
@@ -2631,11 +3891,102 @@ class Browser(QMainWindow):
             .replace("{{APP_NAME}}", escape(self.display_name()))
             .replace("{{BACKGROUND}}", INCOGNITO_BACKGROUND if self.incognito else self.home_background_css())
             .replace("{{BODY_FONT}}", self.body_font_css())
+            .replace("{{BODY_CLASS}}", "" if self.settings.get("animations", True) else "noanim")
             .replace("{{MARK_BACKGROUND}}", INCOGNITO_MARK if self.incognito else NORMAL_MARK)
             .replace("{{NOTE}}", escape(INCOGNITO_NOTE) if self.incognito else "")
             .replace("{{ASSISTANT_NAME}}", escape(ASSISTANT_NAME))
             .replace("{{FONT_FACE}}", self.font_face_css())
+            .replace("{{WIDGET_LAYER}}", self.widget_layer_html())  # keep this one last
         )
+
+    def load_widget_state(self):
+        raw = self.settings.get("home_widgets", "")
+        try:
+            return sanitize_widget_state(json.loads(raw) if raw else {})
+        except ValueError:
+            return sanitize_widget_state({})
+
+    def widget_layer_html(self):
+        """The movable widgets for the home screen (not shown in incognito windows)."""
+        if self.incognito:
+            return ""
+        bookmarks = sorted(self.bookmarks.entries, key=lambda e: e["time"], reverse=True)[:12]
+        recent, seen = [], set()
+        if self.history is not None:
+            for entry in reversed(self.history.entries):
+                if entry["url"] not in seen and entry["url"].startswith(("http://", "https://")):
+                    seen.add(entry["url"])
+                    recent.append({"title": entry["title"][:80], "url": entry["url"]})
+                if len(recent) >= 10:
+                    break
+        payload = {
+            "token": HOME_TOKEN,
+            "state": self.load_widget_state(),
+            "profiles": {
+                "current": self.profile_name,
+                "all": [p["name"] for p in load_profiles()["profiles"]],
+            },
+            "bookmarks": [{"title": b["title"][:80], "url": b["url"]} for b in bookmarks],
+            "history": recent,
+            "newsSources": [{"id": key, "name": value[0]} for key, value in NEWS_SOURCES.items()],
+        }
+        data = json.dumps(payload).replace("<", "\\u003c")  # so a note can never close the script
+        return (
+            f"<style>{WIDGET_CSS}</style>\n"
+            f"<script>window.FILIPS_HOME = {data};</script>\n"
+            f"<script>{WIDGET_JS}</script>\n"
+        )
+
+    def on_home_message(self, view, payload):
+        """The home page saved its widget layout, or asked for weather or news."""
+        if self.incognito or not getattr(view, "showing_home", False):
+            return
+        try:
+            message = json.loads(payload)
+        except ValueError:
+            return
+        if not isinstance(message, dict) or message.get("t") != HOME_TOKEN:
+            return  # not from our own home page
+        action, data = message.get("a"), message.get("d")
+        if action == "state":
+            self.settings.set("home_widgets", json.dumps(sanitize_widget_state(data)))
+        elif action == "fetch" and isinstance(data, dict):
+            self.start_home_fetch(view, data)
+
+    def start_home_fetch(self, view, data):
+        kind = data.get("kind")
+        if kind == "weather":
+            params = {
+                "city": str(data.get("city", ""))[:80],
+                "unit": "f" if data.get("unit") == "f" else "c",
+            }
+        elif kind == "news":
+            params = {"source": str(data.get("source", "bbc"))[:30], "custom": str(data.get("custom", ""))[:300]}
+        else:
+            return
+        self.home_job += 1
+        worker = HomeDataWorker(self.home_job, id(view), kind, params)
+        worker.done.connect(self.on_home_data)
+        self.home_workers[self.home_job] = worker
+        worker.start()
+
+    def on_home_data(self, result):
+        worker = self.home_workers.pop(result["job"], None)
+        if worker is not None:
+            worker.wait()
+        for index in range(self.tabs.count()):
+            view = self.tabs.widget(index)
+            if id(view) == result["view_id"] and getattr(view, "showing_home", False):
+                payload = {
+                    "ok": result["ok"],
+                    "data": result.get("data"),
+                    "error": result.get("error", ""),
+                }
+                script = (
+                    "window.filipsData && window.filipsData("
+                    f"{json.dumps(result['kind'])}, {json.dumps(payload)});"
+                )
+                view.page().runJavaScript(script)
 
     def font_face_css(self):
         """CSS that embeds the Oswald font from the fonts folder (empty if not found)."""
@@ -2668,12 +4019,12 @@ class Browser(QMainWindow):
         parts = []
         for i, item in enumerate(self.load_shortcuts()):
             parts.append(
-                '<div class="tile">'
+                f'<div class="tile" style="--i:{i}">'
                 f'<a class="site" href="{escape(item["url"])}">{escape(item["name"])}</a>'
                 f'<a class="x" href="browser://remove?i={i}" title="Remove">×</a>'
                 "</div>"
             )
-        parts.append('<a class="add" href="browser://add">+ Add site</a>')
+        parts.append(f'<a class="add" style="--i:{len(parts)}" href="browser://add">+ Add site</a>')
         return "\n    ".join(parts)
 
     def refresh_home_tabs(self):
@@ -2726,14 +4077,53 @@ class Browser(QMainWindow):
             self.close_panel()
             return
         was_hidden = self.panel.isHidden()
+        if was_hidden:
+            self.panel.setMinimumWidth(0)  # it starts closed and slides open
+            self.splitter.setSizes([0, max(1, self.splitter.width())])
         self.panel.show_service(service)
         self.sidebar.set_active(service["id"])
-        if was_hidden:
-            self.splitter.setSizes([440, max(300, self.splitter.width() - 440)])
+        if was_hidden or self.panel_closing:
+            self.animate_panel(opening=True, start=0 if was_hidden else None)
 
     def close_panel(self):
-        self.panel.hide()
         self.sidebar.set_active(None)
+        if not self.panel.isHidden():
+            self.animate_panel(opening=False)
+
+    def animate_panel(self, opening, start=None):
+        """Slide the site panel open or closed."""
+        if self.panel_animation is not None:
+            self.panel_animation.stop()
+        total = max(1, self.splitter.width())
+        target = min(440, max(300, total // 2))
+        begin = self.panel.width() if start is None else start
+        end = target if opening else 0
+        self.panel_closing = not opening
+
+        def set_width(value):
+            width = int(value)
+            self.splitter.setSizes([width, max(1, total - width)])
+
+        def finished():
+            self.panel_closing = False
+            if not opening:
+                self.panel.hide()
+            self.panel.setMinimumWidth(320)
+
+        self.panel.setMinimumWidth(0)
+        if not ANIMATIONS_ENABLED:
+            set_width(end)
+            finished()
+            return
+        animation = QVariantAnimation(self)
+        animation.setDuration(230)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.setStartValue(begin)
+        animation.setEndValue(end)
+        animation.valueChanged.connect(set_width)
+        animation.finished.connect(finished)
+        self.panel_animation = animation
+        animation.start()
 
     def open_sidebar_settings(self):
         if self.sidebar_dialog is None:
@@ -3181,6 +4571,14 @@ class Browser(QMainWindow):
         if action == "assistant":
             self.open_assistant()
             return
+        if action == "openprofile":
+            name = QUrlQuery(url).queryItemValue("name")
+            if any(p["name"] == name for p in load_profiles()["profiles"]):
+                self.open_profile_window(name)
+            return
+        if action == "newprofile":
+            self.create_profile()
+            return
         items = self.load_shortcuts()
         if action == "add":
             dialog = AddShortcutDialog(self)
@@ -3212,6 +4610,7 @@ class Browser(QMainWindow):
         if not hasattr(self.profile, "extensionManager"):
             note = self.ext_menu.addAction("Needs PySide6 6.10 or newer")
             note.setEnabled(False)
+            self.ext_menu.addAction("Why don't extensions work?", self.show_extension_status)
             return
         self.ext_manager = self.profile.extensionManager()
         # Extensions start out disabled, so switch them on once they are ready.
@@ -3227,8 +4626,17 @@ class Browser(QMainWindow):
 
     def rebuild_extension_menu(self):
         self.ext_menu.clear()
-        self.ext_menu.addAction("Install from folder…", self.install_from_folder)
-        self.ext_menu.addAction("Install from .zip…", self.install_from_zip)
+        store_id = store_extension_id(self.current_page_url())
+        if store_id:
+            self.ext_menu.addAction(
+                "Add this page's extension to the browser",
+                lambda _c=False, i=store_id: self.start_extension_download(i),
+            )
+            self.ext_menu.addSeparator()
+        self.ext_menu.addAction("Add from Chrome Web Store…", self.add_from_web_store)
+        self.ext_menu.addAction("Install from a .crx or .zip file…", self.install_from_zip)
+        self.ext_menu.addAction("Install from a folder…", self.install_from_folder)
+        self.ext_menu.addAction("Extension status…", self.show_extension_status)
         self.ext_menu.addSeparator()
 
         extensions = self.ext_manager.extensions()
@@ -3254,10 +4662,124 @@ class Browser(QMainWindow):
 
     def install_from_zip(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Choose an extension .zip", "", "Zip files (*.zip)"
+            self, "Choose an extension file", "", "Extension files (*.crx *.zip);;All files (*)"
         )
-        if path:
-            self.ext_manager.installExtension(path)
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as error:
+            QMessageBox.warning(self, "Extension", f"The file couldn't be read: {error}")
+            return
+        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(path))[0])
+        self.install_extension_bytes(data, name or "extension")
+
+    def add_from_web_store(self):
+        if self.ext_manager is None:
+            self.show_extension_status()
+            return
+        suggestion = self.current_page_url() if store_extension_id(self.current_page_url()) else ""
+        text, ok = QInputDialog.getText(
+            self,
+            "Add from Chrome Web Store",
+            "Paste the extension's Chrome Web Store link (or its 32-letter ID):",
+            QLineEdit.EchoMode.Normal,
+            suggestion,
+        )
+        if not ok:
+            return
+        extension_id = extension_id_from_text(text)
+        if not extension_id:
+            QMessageBox.warning(
+                self,
+                "Chrome Web Store",
+                "That doesn't look like a Chrome Web Store link or extension ID.",
+            )
+            return
+        self.start_extension_download(extension_id)
+
+    def start_extension_download(self, extension_id):
+        if self.ext_manager is None:
+            self.show_extension_status()
+            return
+        if self.ext_worker is not None:
+            self.statusBar().showMessage("An extension is already being downloaded.", 4000)
+            return
+        match = re.search(r"Chrome/([\d.]+)", self.profile.httpUserAgent())
+        version = match.group(1) if match else "130.0.0.0"
+        self.statusBar().showMessage("Downloading the extension\u2026")
+        worker = ExtensionDownloader(extension_id, version)
+        worker.succeeded.connect(self.on_extension_downloaded)
+        worker.failed.connect(self.on_extension_download_failed)
+        self.ext_worker = worker
+        worker.start()
+
+    def finish_ext_worker(self):
+        if self.ext_worker is not None:
+            self.ext_worker.wait()
+            self.ext_worker = None
+
+    def on_extension_download_failed(self, message):
+        self.finish_ext_worker()
+        self.statusBar().clearMessage()
+        QMessageBox.warning(self, "Chrome Web Store", message)
+
+    def on_extension_downloaded(self, data):
+        extension_id = self.ext_worker.extension_id if self.ext_worker is not None else "extension"
+        self.finish_ext_worker()
+        self.install_extension_bytes(data, extension_id)
+
+    def install_extension_bytes(self, data, name):
+        """Unpack an extension file and hand it to Qt to install."""
+        if self.ext_manager is None:
+            self.show_extension_status()
+            return
+        folder = os.path.join(self.data.dir, "extension_files", name)
+        try:
+            manifest = unpack_extension(data, folder)
+        except (ValueError, OSError, KeyError) as error:
+            self.statusBar().clearMessage()
+            QMessageBox.warning(self, "Extension", f"This extension couldn't be unpacked: {error}")
+            return
+        if manifest.get("manifest_version") != 3:
+            shutil.rmtree(folder, ignore_errors=True)
+            self.statusBar().clearMessage()
+            QMessageBox.warning(
+                self,
+                "Extension not supported",
+                "This extension uses the older \"Manifest V2\" format, which this browser "
+                "can't run. Only Manifest V3 extensions work.\n\n"
+                "Many popular extensions have a separate V3 version (for example "
+                "\"uBlock Origin Lite\" instead of \"uBlock Origin\").",
+            )
+            return
+        self.statusBar().showMessage("Installing the extension\u2026", 5000)
+        self.ext_manager.installExtension(folder)
+
+    def show_extension_status(self):
+        import PySide6
+
+        lines = [f"PySide6 version: {PySide6.__version__}", f"Qt version: {qVersion()}", ""]
+        if self.ext_manager is None:
+            lines.append("This version of PySide6 has no extension support (it needs 6.10 or newer).")
+            lines.append("Update it with:  py -3.12 -m pip install --upgrade PySide6")
+        else:
+            extensions = self.ext_manager.extensions()
+            lines.append(f"Extensions installed: {len(extensions)}")
+            for info in extensions:
+                state = "on" if info.isEnabled() else "off"
+                problem = info.error()
+                lines.append(
+                    f"  - {info.name() or info.path()} ({state})"
+                    + (f" - problem: {problem}" if problem else "")
+                )
+            lines.append("")
+            lines.append(
+                "Only Manifest V3 extensions work. Many extensions in the store are still the "
+                "older Manifest V2 format and can't be installed."
+            )
+        QMessageBox.information(self, "Extension status", "\n".join(lines))
 
     def open_popup(self, info):
         url = info.actionPopupUrl()
@@ -3284,11 +4806,25 @@ class Browser(QMainWindow):
         index = self.tabs.addTab(view, "New Tab")
         self.tabs.setCurrentIndex(index)
 
+        close_button = QToolButton()
+        close_button.setText("\u2715")
+        close_button.setToolTip("Close tab")
+        close_button.setFixedSize(26, 26)
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_button.setStyleSheet(CLOSE_BUTTON_STYLE)
+        close_button.clicked.connect(
+            lambda _c=False, v=view: self.close_tab(self.tabs.indexOf(v))
+        )
+        self.tabs.tabBar().setTabButton(index, QTabBar.ButtonPosition.RightSide, close_button)
+
         view.titleChanged.connect(
             lambda title, v=view: self.tabs.setTabText(
-                self.tabs.indexOf(v), title[:20] or "New Tab"
+                self.tabs.indexOf(v), title[:40] or "New Tab"
             )
         )
+        view.loadStarted.connect(lambda v=view: self.on_load_started(v))
+        view.loadProgress.connect(lambda p, v=view: self.on_load_progress(v, p))
+        view.loadFinished.connect(lambda ok, v=view: self.on_load_done(v))
         view.urlChanged.connect(lambda u, v=view: self.on_url_changed(u, v))
         view.loadFinished.connect(lambda ok, v=view: self.on_load_finished(ok, v))
 
@@ -3298,7 +4834,54 @@ class Browser(QMainWindow):
             self.show_home(view)
         return view
 
+    def on_load_started(self, view):
+        view.loading = True
+        view.progress = 8
+        if view is self.current_view():
+            self.update_load_bar()
+
+    def on_load_progress(self, view, percent):
+        view.progress = percent
+        if view is self.current_view():
+            self.update_load_bar()
+
+    def on_load_done(self, view):
+        view.loading = False
+        view.progress = 100
+        if view is self.current_view():
+            self.update_load_bar()
+
+    def update_load_bar(self):
+        view = self.current_view()
+        if view is not None and view.loading:
+            self.load_bar.show()
+            self.animate_load_bar(max(view.progress, 8))
+        elif self.load_bar.isVisible():
+            self.animate_load_bar(100)
+            QTimer.singleShot(260, self.hide_load_bar)
+
+    def hide_load_bar(self):
+        view = self.current_view()
+        if view is None or not view.loading:
+            self.load_bar.hide()
+            self.load_bar.setValue(0)
+
+    def animate_load_bar(self, value):
+        if not ANIMATIONS_ENABLED:
+            self.load_bar.setValue(value)
+            return
+        if self.bar_animation is not None:
+            self.bar_animation.stop()
+        animation = QPropertyAnimation(self.load_bar, b"value", self)
+        animation.setDuration(180)
+        animation.setStartValue(self.load_bar.value())
+        animation.setEndValue(value)
+        self.bar_animation = animation
+        animation.start()
+
     def close_tab(self, index):
+        if index < 0:
+            return
         if self.tabs.count() < 2:
             self.close()
             return
@@ -3318,6 +4901,7 @@ class Browser(QMainWindow):
         if view:
             self.url_bar.setText(self.url_text(view.url()))
         self.update_star()
+        self.update_load_bar()
 
     def on_url_changed(self, url, view):
         if url.scheme() in ("http", "https", "file"):
@@ -3325,6 +4909,11 @@ class Browser(QMainWindow):
         if view is self.current_view():
             self.url_bar.setText(self.url_text(url))
             self.update_star()
+            if self.ext_manager is not None and store_extension_id(url.toString()):
+                self.statusBar().showMessage(
+                    "This is a Chrome Web Store page. Use the Extensions menu to add it to this browser.",
+                    8000,
+                )
 
     def focus_url_bar(self):
         self.url_bar.setFocus()
@@ -3350,6 +4939,8 @@ def main():
     app_icon = make_icon({"id": "app", "color": "#6ea8ff", "letter": "F"})
     app.setWindowIcon(app_icon)
     NOTIFICATIONS = NotificationCenter(app_icon)
+    fade_filter = FadeInFilter()
+    app.installEventFilter(fade_filter)
 
     AD_DOMAINS.update(load_custom_blocklist(os.path.join(BASE_DIR, "blocklist.txt")))
     cleanup_pending_profiles()
